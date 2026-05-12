@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+# ============================================================
+#  fin — Selachii Linux Package Manager
+#  GPL v3
+#  scripts/fin — thin launcher
+#
+#  When running from source:   python scripts/fin <cmd>
+#  When installed via make:    /usr/bin/fin <cmd>
+#                              (sys.path line gets patched by Makefile
+#                               to point at /usr/lib/fin instead)
+# ============================================================
+
+import sys
+import os
+
+# running from source root → add repo root to path so `import fin` works
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from fin.cli import main
+
+if __name__ == "__main__":
+    main()
