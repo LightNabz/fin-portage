@@ -8,11 +8,12 @@
 import sys
 import os
 
-from fin.adopt.lfs   import adopt_lfs
-from fin.adopt.blfs  import adopt_blfs
-from fin.guard       import Guard, ProtectionError
-from fin.emerge      import EmergeWrapper
-from fin.db.local_db import LocalDB
+from fin.adopt.lfs        import adopt_lfs
+from fin.adopt.blfs       import adopt_blfs
+from fin.guard            import Guard, ProtectionError
+from fin.emerge           import EmergeWrapper
+from fin.db.local_db      import LocalDB
+from fin.portage_register import portage_register
 
 
 HELP = """\
@@ -25,6 +26,13 @@ COMMANDS:
     adopt lfs               Stamp LFS base packages as protected (run FIRST!)
     adopt blfs              Auto-discover BLFS packages from filesystem
     adopt all               Run both adopt lfs then adopt blfs
+
+    portage-register        Write VDB stubs + soname-provided so Portage
+                            knows your LFS system exists (run after adopt lfs)
+
+    sync                    Sync the Gentoo ebuild tree (emerge --sync)
+                            then report if any LFS-BASE packages have upstream
+                            version updates available (informational only)
 
     install <pkg...>        Install packages via Portage (guarded)
     remove  <pkg...>        Remove packages via Portage (guarded)
@@ -45,9 +53,10 @@ OPTIONS:
     --force-unprotect <p>   Dangerous: bypass protection for package p
 
 EXAMPLES:
+    fin adopt lfs
     fin adopt all
-    fin adopt lfs --dry-run
-    fin adopt blfs --threshold 8
+    fin portage-register
+    fin sync
     fin install dev-libs/boost
     fin update @world
     fin list protected
@@ -63,6 +72,11 @@ def parse_flag(args: list[str], flag: str, default=None):
         except IndexError:
             die(f"{flag} requires an argument")
     return default
+
+
+def cmd_portage_register(args: list[str]):
+    dry_run = "--dry-run" in args
+    portage_register(dry_run=dry_run)
 
 
 def cmd_adopt(args: list[str]):
@@ -82,6 +96,90 @@ def cmd_adopt(args: list[str]):
         adopt_blfs(dry_run=dry_run, threshold=threshold)
     else:
         die(f"Unknown adopt subcommand: {subcmd!r}")
+
+
+def cmd_sync(args: list[str]):
+    import subprocess
+    import shutil
+
+    # ── preflight checks ──────────────────────────────────────
+    if not shutil.which("emerge"):
+        die(
+            "emerge not found. Install Portage first.\n"
+            "   See: https://wiki.gentoo.org/wiki/Project:Portage"
+        )
+
+    db = LocalDB()
+    protected = db.list_protected()
+    if not protected:
+        print(
+            "\n   ⚠  fin: no LFS-BASE packages in LocalDB.\n"
+            "   ⚠  Run `fin adopt lfs` and `fin portage-register` first.\n",
+            file=sys.stderr
+        )
+        # don't block the sync itself — just warn
+
+    # ── run emerge --sync ─────────────────────────────────────
+    print()
+    print("   🦈 fin sync — syncing Gentoo ebuild tree")
+    print("   ─────────────────────────────────────────────")
+    print()
+
+    result = subprocess.run(["emerge", "--sync"])
+
+    if result.returncode != 0:
+        print("\n   ✗ emerge --sync failed.\n", file=sys.stderr)
+        sys.exit(result.returncode)
+
+    # ── post-sync: check for upstream updates to LFS packages ─
+    # informational only — fin never lets emerge actually touch them
+    if not protected or not shutil.which("portageq"):
+        print("\n   ✓ Sync complete.\n")
+        return
+
+    print()
+    print("   🦈 Checking for upstream updates to LFS-BASE packages...")
+    print("   (informational — fin will still block any Portage upgrade)")
+    print()
+
+    updates: list[tuple[str, str, str]] = []
+
+    for pkg in protected:
+        from fin.config import CATEGORY_MAP  # local import to avoid circular
+        category = _category_for(pkg.name)
+        atom     = f"{category}/{pkg.name}"
+
+        try:
+            proc = subprocess.run(
+                ["portageq", "best_visible", "/", atom],
+                capture_output=True, text=True, timeout=5
+            )
+            upstream_ver = proc.stdout.strip()
+            if upstream_ver and upstream_ver != f"{atom}-0":
+                updates.append((pkg.name, "LFS-BASE", upstream_ver))
+        except Exception:
+            continue
+
+    if updates:
+        print(f"   {'Package':<30} {'Your ver':<15} {'Upstream'}")
+        print(f"   {'─'*30} {'─'*15} {'─'*30}")
+        for name, local_ver, upstream in updates:
+            print(f"   {name:<30} {local_ver:<15} {upstream}")
+        print()
+        print("   ℹ  These are available upstream but PROTECTED by fin.")
+        print("   ℹ  Rebuild manually from LFS/BLFS source if you want to update.")
+    else:
+        print("   ✓ No upstream updates detected for LFS-BASE packages.")
+
+    print()
+    print("   ✓ fin sync complete. Run `fin install <pkg>` to install new packages.")
+    print()
+
+
+def _category_for(pkg_name: str) -> str:
+    """Look up Gentoo category for an LFS package name."""
+    from fin.portage_register import CATEGORY_MAP
+    return CATEGORY_MAP.get(pkg_name, "sys-apps")
 
 
 def cmd_install(args: list[str]):
@@ -182,12 +280,14 @@ def main():
 
     try:
         dispatch = {
-            "adopt":   cmd_adopt,
-            "install": cmd_install,
-            "remove":  cmd_remove,
-            "update":  cmd_update,
-            "list":    cmd_list,
-            "check":   cmd_check,
+            "adopt":             cmd_adopt,
+            "portage-register":  cmd_portage_register,
+            "sync":              cmd_sync,
+            "install":           cmd_install,
+            "remove":            cmd_remove,
+            "update":            cmd_update,
+            "list":              cmd_list,
+            "check":             cmd_check,
         }
 
         if cmd not in dispatch:
