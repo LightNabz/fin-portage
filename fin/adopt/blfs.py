@@ -7,13 +7,87 @@
 #  Inspired by Sven (HANS TECH © 2024, GPL v3)
 #  Original: scripts/adopt_blfs.py
 #  Adapted for Portage/Gentoo repo instead of Arch SyncDB
+#
+#  Two modes:
+#    • VDB mode   — Portage is installed, match against /var/db/pkg
+#    • Offline mode — no Portage yet, score against BLFS_KNOWN list
 # ============================================================
 
 from pathlib import Path
+from dataclasses import dataclass
 
 from fin.db.local_db import LocalDB
 from fin.db.portage_db import PortageDB, PortagePkg
 from fin.db.models import Package, Origin
+
+
+# ── Known BLFS packages for offline/no-VDB mode ──────────────
+# Common packages people build from BLFS before Portage is around.
+# Keyed as (name, expected_binary, expected_lib, expected_pc)
+# Any match gets scored — same engine, different source list.
+
+BLFS_KNOWN: list[dict] = [
+    # libs
+    {"name": "libxml2",    "lib": "libxml2",    "pc": "libxml-2.0"},
+    {"name": "libxslt",    "lib": "libxslt",    "pc": "libxslt"},
+    {"name": "sqlite",     "lib": "libsqlite3", "pc": "sqlite3"},
+    {"name": "curl",       "lib": "libcurl",    "pc": "libcurl",   "bin": "curl"},
+    {"name": "libpng",     "lib": "libpng",     "pc": "libpng"},
+    {"name": "libjpeg",    "lib": "libjpeg",    "pc": "libjpeg"},
+    {"name": "freetype",   "lib": "libfreetype","pc": "freetype2"},
+    {"name": "fontconfig", "lib": "libfontconfig","pc":"fontconfig","bin":"fc-list"},
+    {"name": "harfbuzz",   "lib": "libharfbuzz","pc": "harfbuzz"},
+    {"name": "glib",       "lib": "libglib-2.0","pc": "glib-2.0"},
+    {"name": "dbus",       "lib": "libdbus-1",  "pc": "dbus-1",    "bin": "dbus-daemon"},
+    {"name": "pcre2",      "lib": "libpcre2-8", "pc": "libpcre2-8"},
+    {"name": "libevent",   "lib": "libevent",   "pc": "libevent"},
+    {"name": "libuv",      "lib": "libuv",      "pc": "libuv"},
+    {"name": "zlib",       "lib": "libz"},
+    {"name": "lz4",        "lib": "liblz4",     "pc": "liblz4"},
+    {"name": "zstd",       "lib": "libzstd",    "pc": "libzstd"},
+    {"name": "xz",         "lib": "liblzma",    "pc": "liblzma"},
+    {"name": "bzip2",      "lib": "libbz2"},
+    {"name": "libffi",     "lib": "libffi",     "pc": "libffi"},
+    {"name": "openssl",    "lib": "libssl",     "pc": "openssl",   "bin": "openssl"},
+    {"name": "nss",        "lib": "libnss3",    "pc": "nss"},
+    {"name": "gnutls",     "lib": "libgnutls",  "pc": "gnutls"},
+    {"name": "cyrus-sasl", "lib": "libsasl2"},
+    {"name": "krb5",       "lib": "libkrb5",    "bin": "kinit"},
+    # networking
+    {"name": "wget",       "bin": "wget"},
+    {"name": "openssh",    "bin": "ssh"},
+    {"name": "rsync",      "bin": "rsync"},
+    {"name": "git",        "bin": "git"},
+    {"name": "lynx",       "bin": "lynx"},
+    # system tools
+    {"name": "sudo",       "bin": "sudo"},
+    {"name": "which",      "bin": "which"},
+    {"name": "pciutils",   "bin": "lspci"},
+    {"name": "usbutils",   "bin": "lsusb"},
+    {"name": "lvm2",       "bin": "lvm",        "lib": "libdevmapper"},
+    {"name": "mdadm",      "bin": "mdadm"},
+    {"name": "dosfstools", "bin": "mkfs.fat"},
+    {"name": "ntfs-3g",    "bin": "ntfs-3g"},
+    # dev tools
+    {"name": "cmake",      "bin": "cmake"},
+    {"name": "ninja",      "bin": "ninja"},
+    {"name": "meson",      "bin": "meson"},
+    {"name": "llvm",       "bin": "llvm-config","lib": "libLLVM"},
+    {"name": "rust",       "bin": "rustc"},
+    {"name": "go",         "bin": "go"},
+    {"name": "nodejs",     "bin": "node"},
+    {"name": "python-pip", "bin": "pip3"},
+    # X / Wayland
+    {"name": "xorg-server","bin": "Xorg"},
+    {"name": "wayland",    "lib": "libwayland-client","pc":"wayland-client"},
+    {"name": "mesa",       "lib": "libGL",      "pc": "gl"},
+    {"name": "libdrm",     "lib": "libdrm",     "pc": "libdrm"},
+    {"name": "libinput",   "lib": "libinput",   "pc": "libinput"},
+    # audio
+    {"name": "alsa-lib",   "lib": "libasound",  "pc": "alsa"},
+    {"name": "pulseaudio", "bin": "pulseaudio", "lib": "libpulse"},
+    {"name": "pipewire",   "bin": "pipewire",   "lib": "libpipewire-0.3"},
+]
 
 
 # ── Scan targets ─────────────────────────────────────────────
@@ -145,22 +219,60 @@ def score_package(
     return score, reasons
 
 
+# ── Offline scorer (no VDB) ───────────────────────────────────
+
+def score_known(
+    entry: dict,
+    system_libs: set[str],
+    system_bins: set[str],
+    system_pcs:  set[str],
+) -> tuple[int, list[str]]:
+    """Score a BLFS_KNOWN entry against the scanned filesystem."""
+    score   = 0
+    reasons = []
+
+    if bin_ := entry.get("bin"):
+        if bin_ in system_bins:
+            score += 10
+            reasons.append(f"binary:{bin_}")
+
+    if lib := entry.get("lib"):
+        for candidate in (lib, f"{lib}.so", f"lib{lib}.so"):
+            if candidate in system_libs:
+                score += 7
+                reasons.append(f"lib:{candidate}")
+                break
+
+    if pc := entry.get("pc"):
+        if pc in system_pcs:
+            score += 6
+            reasons.append(f"pkgconfig:{pc}")
+
+    return score, reasons
+
+
 # ── Main adopt function ───────────────────────────────────────
 
 def adopt_blfs(dry_run: bool = False, threshold: int = SCORE_THRESHOLD) -> int:
     """
-    Scan the filesystem, match against Portage VDB, and register
-    detected BLFS packages into fin's LocalDB as BLFS-AUTO.
+    Scan the filesystem, match against Portage VDB (if available) or
+    the built-in BLFS_KNOWN list (offline fallback), and register
+    detected packages into fin's LocalDB as BLFS-AUTO.
 
     Returns the count of adopted packages.
     """
     local_db   = LocalDB()
     portage_db = PortageDB()
+    vdb_mode   = portage_db.is_available()
 
     print()
     print("   ╭──────────────────────────────────────────────────╮")
     print("   │  fin adopt blfs  —  Auto-Discovery & Adoption    │")
     print("   ╰──────────────────────────────────────────────────╯")
+    print()
+
+    mode_label = "Portage VDB" if vdb_mode else "offline BLFS known-list"
+    print(f"   mode: {mode_label}")
     print()
 
     # ── Phase 1: Scan ─────────────────────────────────────────
@@ -176,42 +288,48 @@ def adopt_blfs(dry_run: bool = False, threshold: int = SCORE_THRESHOLD) -> int:
     print(f"         {len(system_includes):>5} include directories")
 
     # ── Phase 2: Match ────────────────────────────────────────
-    print("\n   [2/3] Matching against Portage VDB...")
-
-    if not portage_db.is_available():
-        print("   ⚠  Portage VDB not found at /var/db/pkg")
-        print("   ⚠  Run `fin sync` first to populate the Portage tree,")
-        print("      or install Portage before running `fin adopt blfs`.")
-        return 0
-
     already_installed = set(local_db.list_installed())
-    portage_pkgs      = portage_db.list_installed()
 
-    candidates: list[tuple[PortagePkg, int, list[str]]] = []
+    # result shape: list of (name, version, score, reasons)
+    candidates: list[tuple[str, str, int, list[str]]] = []
 
-    for pkg in portage_pkgs:
-        if pkg.name in already_installed:
-            continue
+    if vdb_mode:
+        print("\n   [2/3] Matching against Portage VDB (/var/db/pkg)...")
+        portage_pkgs = portage_db.list_installed()
 
-        score, reasons = score_package(
-            pkg, system_libs, system_bins, system_pcs, system_includes
-        )
+        for pkg in portage_pkgs:
+            if pkg.name in already_installed:
+                continue
+            score, reasons = score_package(
+                pkg, system_libs, system_bins, system_pcs, system_includes
+            )
+            if score >= threshold:
+                candidates.append((pkg.name, pkg.version, score, reasons))
 
-        if score >= threshold:
-            candidates.append((pkg, score, reasons))
+    else:
+        print("\n   [2/3] Portage VDB not found — using built-in BLFS known-list...")
+        print("         (install Portage later and re-run for fuller coverage)\n")
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
+        for entry in BLFS_KNOWN:
+            name = entry["name"]
+            if name in already_installed:
+                continue
+            score, reasons = score_known(entry, system_libs, system_bins, system_pcs)
+            if score >= threshold:
+                candidates.append((name, "BLFS", score, reasons))
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
 
     if not candidates:
         print("   ✓ No new packages detected. LocalDB looks comprehensive.")
         return 0
 
-    print(f"         {len(candidates)} packages detected on system\n")
+    print(f"         {len(candidates)} packages detected\n")
 
-    preview = candidates[:25]
-    for pkg, score, reasons in preview:
+    for name, ver, score, reasons in candidates[:25]:
         reason_str = ", ".join(reasons[:2])
-        print(f"      + {pkg.atom:<45} score={score:>2}  ({reason_str})")
+        label = f"{name}-{ver}" if ver != "BLFS" else name
+        print(f"      + {label:<45} score={score:>2}  ({reason_str})")
 
     if len(candidates) > 25:
         print(f"      ... and {len(candidates) - 25} more")
@@ -224,16 +342,16 @@ def adopt_blfs(dry_run: bool = False, threshold: int = SCORE_THRESHOLD) -> int:
     adopted = 0
     failed  = 0
 
-    for pkg, score, reasons in candidates:
+    for name, ver, score, reasons in candidates:
         try:
             local_pkg = Package(
-                name      = pkg.name,
-                version   = f"BLFS-{pkg.version}",
-                desc      = f"Auto-discovered BLFS package (Portage: {pkg.atom})",
+                name      = name,
+                version   = f"BLFS-{ver}" if ver != "BLFS" else "BLFS",
+                desc      = f"Auto-discovered BLFS package",
                 url       = "",
-                provides  = pkg.provides or [],
+                provides  = [],
                 origin    = Origin.BLFS_AUTO,
-                protected = False,  # BLFS packages are tracked but NOT protected
+                protected = False,
             )
 
             if not dry_run:
@@ -242,7 +360,7 @@ def adopt_blfs(dry_run: bool = False, threshold: int = SCORE_THRESHOLD) -> int:
             adopted += 1
 
         except Exception as e:
-            print(f"      ⚠  Failed to adopt {pkg.name}: {e}")
+            print(f"      ⚠  Failed to adopt {name}: {e}")
             failed += 1
 
     print()

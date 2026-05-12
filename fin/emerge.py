@@ -84,6 +84,22 @@ class EmergeWrapper:
             return EmergeResult(returncode=1, blocked=True, reason=msg)
 
         # ── Step 3: run emerge ────────────────────────────────
+        if not _emerge_available():
+            print(
+                "\n   🦈 fin — PORTAGE NOT FOUND\n"
+                "   ─────────────────────────────────────────────\n"
+                "   emerge is not installed on this system yet.\n"
+                "\n"
+                "   fin uses Portage as its backend. To install it\n"
+                "   manually from source (LFS style):\n"
+                "\n"
+                "     https://wiki.gentoo.org/wiki/Project:Portage\n"
+                "\n"
+                "   Once Portage is installed, re-run this command.\n",
+                file=sys.stderr
+            )
+            return EmergeResult(returncode=1, blocked=False, reason="emerge not found")
+
         emerge_cmd = self._build_cmd(operation, atoms, extra_args)
         print(f"   🦈 fin: running {' '.join(emerge_cmd)}\n")
 
@@ -156,6 +172,12 @@ class EmergeWrapper:
                 )
             )
             print(f"   ✓ registered {pkg.atom} in fin LocalDB")
+
+
+def _emerge_available() -> bool:
+    """Check if emerge is actually on PATH before trying to call it."""
+    import shutil
+    return shutil.which("emerge") is not None
 
 
 def _atom_to_name(atom: str) -> str:
