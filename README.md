@@ -1,7 +1,9 @@
-# 🦈 fin — Selachii Linux Package Manager
+# fin — Selachii Linux Package Manager
 
 > Portage wrapper with LFS awareness. Named after the shark fin — for Selachii.
 
+
+## ATTENTION: THIS PROJECT WAS A FAILED PROJECT T_T
 ---
 
 ## What is fin?
